@@ -852,7 +852,7 @@ def decode(file_name, input_path=None, processes = (cpu_count()//2), seed=123456
             len_last = (k - 1) % l_in + 1
             lim = 6                                
             lambda_depths = [0]*lim
-            lambda_depths[0] = 0
+            lambda_depths[0] = 1
             lambda_depths[1] = 0
             lambda_depths[2] = 0
 
