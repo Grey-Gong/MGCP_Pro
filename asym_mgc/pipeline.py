@@ -46,13 +46,32 @@ from .outer.outer_soft import (
 @dataclass
 class StrandResult:
     """Result of decoding a single DNA strand."""
-    dna_decoded: str
-    quality: np.ndarray  # Per-position quality scores
+    dna_in: str = ''
+    dna_out: str = ''
+    dna_decoded: str = ''
+    quality: np.ndarray = field(default_factory=lambda: np.array([]))
+    strong_markers_found: int = 0
     log_prob: float = 0.0
     num_windows: int = 0
-    strong_markers: int = 0
     rs_syndrome_nonzero: bool = False
     fallback_used: int = 0
+    window_stats: List = field(default_factory=list)
+
+    @property
+    def strong_markers(self) -> int:
+        return self.strong_markers_found
+
+    @property
+    def sequence(self) -> str:
+        """Alias for dna_decoded."""
+        return self.dna_decoded
+
+    @property
+    def confidence(self) -> float:
+        """Average quality score as confidence proxy."""
+        if len(self.quality) == 0:
+            return 0.0
+        return float(np.mean(self.quality))
 
 
 # =============================================================================
@@ -60,9 +79,12 @@ class StrandResult:
 # =============================================================================
 
 def compute_soft_branch_metric(
+    transition: str,
     emitted_base: int,
     observed_base: int,
     phred_quality: float,
+    in_homopolymer: bool = False,
+    homopolymer_penalty: float = 2.0,
     channel_probs: Optional[Dict[str, float]] = None,
 ) -> float:
     """
@@ -70,12 +92,18 @@ def compute_soft_branch_metric(
 
     Parameters
     ----------
+    transition : str
+        Transition type: 'MATCH', 'DELETION', or 'INSERTION'.
     emitted_base : int
-        Hypothesized base (0-3).
+        Hypothesized base (0-3, or -1 for deletion/insertion).
     observed_base : int
         Observed base (0-3).
     phred_quality : float
         Phred quality score.
+    in_homopolymer : bool
+        Whether current position is in a homopolymer run.
+    homopolymer_penalty : float
+        Penalty factor for homopolymer errors.
     channel_probs : Optional[Dict]
         Channel probabilities (P_CORR, P_DEL, P_INS, P_SUB).
 
@@ -92,14 +120,29 @@ def compute_soft_branch_metric(
             'P_SUB': 0.214,
         }
 
-    if emitted_base == observed_base:
-        llr = phred_quality * np.log(10)
-        log_p_corr = np.log(channel_probs.get('P_CORR', 0.5) + 1e-12)
-        return llr + log_p_corr
-    else:
-        llr = -phred_quality * np.log(10)
-        log_p_sub = np.log(channel_probs.get('P_SUB', 0.2) + 1e-12)
-        return llr + log_p_sub
+    if transition == 'MATCH':
+        if emitted_base == observed_base:
+            llr = phred_quality * np.log(10)
+            log_p_corr = np.log(channel_probs.get('P_CORR', 0.5) + 1e-12)
+            if in_homopolymer:
+                log_p_corr /= homopolymer_penalty
+            return llr + log_p_corr
+        else:
+            llr = -phred_quality * np.log(10)
+            log_p_sub = np.log(channel_probs.get('P_SUB', 0.2) + 1e-12)
+            return llr + log_p_sub
+
+    elif transition == 'DELETION':
+        log_p_del = np.log(channel_probs.get('P_DEL', 0.26) + 1e-12)
+        if in_homopolymer:
+            log_p_del *= homopolymer_penalty
+        return log_p_del
+
+    elif transition == 'INSERTION':
+        log_p_ins = np.log(channel_probs.get('P_INS', 0.026) + 1e-12)
+        return log_p_ins
+
+    return -np.inf
 
 
 # =============================================================================
@@ -107,33 +150,44 @@ def compute_soft_branch_metric(
 # =============================================================================
 
 def build_strand_copies(
-    dna_template: str,
-    coverage: int,
-    channel: MemoryKNanoporeChannel,
+    dna_template_or_results,
+    coverage: int = 1,
+    channel=None,
     base_quality_mean: float = 25.0,
     seed_start: int = 0,
 ) -> List[Tuple[str, np.ndarray]]:
     """
     Simulate multiple sequencing copies of a DNA template.
 
-    Parameters
-    ----------
-    dna_template : str
-        Reference DNA sequence.
-    coverage : int
-        Number of copies to generate.
-    channel : MemoryKNanoporeChannel
-        Channel model for simulating errors.
-    base_quality_mean : float
-        Mean base quality score.
-    seed_start : int
-        Starting random seed for reproducibility.
-
-    Returns
-    -------
-    List[Tuple[str, np.ndarray]]
-        List of (received_sequence, quality_array) tuples.
+    Supports two call signatures:
+      build_strand_copies(dna_template, coverage, channel, ...)
+      build_strand_copies(List[StrandResult])  -- extracts from strand results
     """
+    # Signature 2: receive a list of StrandResult objects
+    if isinstance(dna_template_or_results, (list, tuple)) and len(dna_template_or_results) > 0:
+        first = dna_template_or_results[0]
+        if hasattr(first, 'dna_decoded'):
+            # Received list of StrandResult; extract (seq, qual) pairs
+            copies = []
+            for sr in dna_template_or_results:
+                if hasattr(sr, 'dna_out') and sr.dna_out:
+                    seq = sr.dna_out
+                elif hasattr(sr, 'dna_decoded'):
+                    seq = sr.dna_decoded
+                else:
+                    seq = ''
+                qual = getattr(sr, 'quality', np.array([]))
+                if qual is None:
+                    qual = np.array([])
+                copies.append((seq, np.array(qual) if not isinstance(qual, np.ndarray) else qual))
+            return copies
+
+    # Signature 1: standard (dna_template, coverage, channel, ...)
+    dna_template = dna_template_or_results
+    if channel is None:
+        from .channel.memory_k_nanopore import MemoryKNanoporeChannel
+        channel = MemoryKNanoporeChannel(Pd=1e-9, Pi=1e-9, Ps=1e-9, seed=seed_start)
+
     copies = []
     for cov in range(coverage):
         y, qual = channel.transmit_with_quality(
@@ -178,7 +232,7 @@ def decode_single_strand(
         quality=quality if quality is not None else np.array([]),
         log_prob=info.get('total_log_prob', 0.0),
         num_windows=info.get('num_windows', 0),
-        strong_markers=info.get('strong_markers_detected', 0),
+        strong_markers_found=info.get('strong_markers_detected', 0),
         rs_syndrome_nonzero=info.get('rs_syndrome_nonzero', 0) > 0,
         fallback_used=info.get('fallback_used', 0),
     )
@@ -338,7 +392,7 @@ class DNAPipeline:
             quality=quality if quality is not None else np.array([]),
             log_prob=info.get('total_log_prob', 0.0),
             num_windows=info.get('num_windows', 0),
-            strong_markers=info.get('strong_markers_detected', 0),
+            strong_markers_found=info.get('strong_markers_detected', 0),
             rs_syndrome_nonzero=info.get('rs_syndrome_nonzero', 0) > 0,
             fallback_used=info.get('fallback_used', 0),
         )

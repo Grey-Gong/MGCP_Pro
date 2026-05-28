@@ -1,12 +1,14 @@
 """
-Asym-MGC Decoder: Marker Detection + Sliding Window + List Viterbi.
+Asym-MGC Decoder: Marker Detection + Sliding Window + List Viterbi + Adaptive Drift.
 
 This module integrates:
 1. levenshtein_distance: for fuzzy marker matching
 2. detect_markers: hierarchical marker detection
 3. split_at_strong_markers: window segmentation
 4. fallback_for_missing_strong_marker: state continuity across windows
-5. AsymMGCDecoder: top-level decoder with sliding window and List Viterbi
+5. rolling_mean: smooth quality scores
+6. adaptive_drift_estimator: quality-based drift window adaptation
+7. AsymMGCDecoder: top-level decoder with sliding window and List Viterbi
 
 Reference: Section 3 of IMPROVEMENT_PLAN.md v2.1.
 Reference: ARCHITECTURE_REVISION_v2_1.md.
@@ -152,8 +154,8 @@ def split_at_strong_markers(
         segments.append((segment, prev_end))
         prev_end = seg_end
 
-    if prev_end < len(seq):
-        segments.append((seq[prev_end:], prev_end))
+    # Always append trailing segment (may be empty if marker was at end)
+    segments.append((seq[prev_end:], prev_end))
 
     return segments
 
@@ -198,6 +200,107 @@ def fallback_for_missing_strong_marker(
         prev_base=best_state.prev_base,
         uncertainty_flag=False,
     )
+
+
+# =============================================================================
+# Adaptive Drift Estimation (Phase 1 Enhancement)
+# =============================================================================
+
+def rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
+    """
+    Compute rolling mean with reflect padding at boundaries.
+
+    Reflect padding: boundary values are mirrored to extend the sequence.
+    For input [v0, v1, ..., vn-1] with window=3:
+    padded = [v0, v0, v1, ..., vn-1, vn-1]
+    Result[i] = mean of window elements centered at position i.
+
+    For inputs shorter than window, returns the mean of all values.
+    """
+    if len(values) == 0:
+        return np.array([])
+
+    if len(values) < window:
+        # Short input: return uniform mean
+        return np.full(len(values), np.mean(values))
+
+    # Reflect padding
+    half = window // 2
+    padded = np.concatenate([
+        np.full(half, values[0]),    # reflect left
+        values,
+        np.full(half, values[-1]),   # reflect right
+    ])
+
+    result = np.zeros(len(values))
+    for i in range(len(values)):
+        start = i
+        end = i + window
+        result[i] = np.mean(padded[start:end])
+
+    return result
+
+
+def adaptive_drift_estimator(
+    quality: np.ndarray,
+    base_D_max: int = 20,
+    base_I_max: int = 4,
+    Q_low: float = 10.0,
+    Q_high: float = 25.0,
+    D_min: int = 5,
+    D_max_max: int = 40,
+    I_min: int = 1,
+    I_max_max: int = 8,
+) -> Tuple[int, int]:
+    """
+    Estimate adaptive drift window bounds based on local quality scores.
+
+    Low quality (Q < Q_low): expand D_max (more deletions expected).
+    High quality (Q > Q_high): contract D_max (fewer errors expected).
+    Linear interpolation in between.
+
+    Parameters
+    ----------
+    quality : np.ndarray
+        Phred quality scores.
+    base_D_max : int
+        Base maximum deletion offset.
+    base_I_max : int
+        Base maximum insertion offset.
+    Q_low : float
+        Quality below which D_max expands.
+    Q_high : float
+        Quality above which D_max contracts.
+    D_min, D_max_max, I_min, I_max_max : int
+        Hard bounds on D_max and I_max.
+
+    Returns
+    -------
+    Tuple[int, int]
+        (D_max, I_max) for current quality window.
+    """
+    if len(quality) == 0:
+        return base_D_max, base_I_max
+
+    q_mean = float(np.mean(quality))
+
+    if q_mean <= Q_low:
+        scale = 1.5
+    elif q_mean >= Q_high:
+        scale = 0.6
+    else:
+        # Linear interpolation between boundaries
+        t = (q_mean - Q_low) / (Q_high - Q_low)
+        scale = 1.5 - 0.9 * t  # 1.5 at Q_low, 0.6 at Q_high
+
+    D_adaptive = int(round(base_D_max * scale))
+    I_adaptive = int(round(base_I_max * scale))
+
+    # Clip to hard bounds
+    D_adaptive = max(D_min, min(D_max_max, D_adaptive))
+    I_adaptive = max(I_min, min(I_max_max, I_adaptive))
+
+    return D_adaptive, I_adaptive
 
 
 # =============================================================================
@@ -263,25 +366,48 @@ class AsymMGCDecoder:
         Pi: float = 0.026,
         Ps: float = 0.474,
         list_k: int = 8,
+        K_best: int = 200,
+        T_threshold: float = 15.0,
         strong_marker: str = 'TACGTA',
         strong_marker_tolerance: int = 1,
         enable_list_viterbi: bool = True,
+        adaptive_drift: bool = False,
+        adaptive_drift_window: int = 20,
+        adaptive_Q_low: float = 10.0,
+        adaptive_Q_high: float = 25.0,
+        branch_metric_mode: str = 'original',
     ):
         self.N = N
         self.l = l
         self.c_crc = c_crc
+        self.c_rs = 8  # RS parity symbols (matches encoder default)
+        self.base_D_max = D_max
+        self.base_I_max = I_max
         self.D_max = D_max
         self.I_max = I_max
+        self.K_best = K_best
+        self.T_threshold = T_threshold
         self.strong_marker = strong_marker
         self.strong_marker_tolerance = strong_marker_tolerance
         self.enable_list_viterbi = enable_list_viterbi
+        self.adaptive_drift = adaptive_drift
+        self.adaptive_drift_window = adaptive_drift_window
+        self.adaptive_Q_low = adaptive_Q_low
+        self.adaptive_Q_high = adaptive_Q_high
+        self.branch_metric_mode = branch_metric_mode
 
         self.decoder = FSMJointDecoder(
             N=N, l=l, c_crc=c_crc,
             D_max=D_max, I_max=I_max,
             Pd=Pd, Pi=Pi, Ps=Ps,
+            K_best=K_best, T_threshold=T_threshold,
             list_k=list_k,
         )
+
+    def _update_decoder_params(self, D_max: int, I_max: int) -> None:
+        """Update the inner decoder's D_max and I_max parameters."""
+        self.decoder.D_max = D_max
+        self.decoder.I_max = I_max
 
     def decode(
         self,
@@ -320,6 +446,7 @@ class AsymMGCDecoder:
         }
 
         if not seq:
+            info['num_windows'] = 1  # Count as 1 window
             return "", info
 
         # Detect markers
@@ -343,6 +470,20 @@ class AsymMGCDecoder:
         for seg_idx, (segment, start_offset) in enumerate(segments):
             if not segment:
                 continue
+
+            # Adaptive drift: update params based on local quality
+            if self.adaptive_drift and quality is not None:
+                seg_quality = quality[start_offset:start_offset + len(segment)]
+                if len(seg_quality) > 0:
+                    smoothed = rolling_mean(seg_quality, self.adaptive_drift_window)
+                    D_new, I_new = adaptive_drift_estimator(
+                        smoothed,
+                        base_D_max=self.base_D_max,
+                        base_I_max=self.base_I_max,
+                        Q_low=self.adaptive_Q_low,
+                        Q_high=self.adaptive_Q_high,
+                    )
+                    self._update_decoder_params(D_new, I_new)
 
             decoded_seg, win_info, fallback = self._decode_window(
                 segment, quality, start_offset, fallback,
@@ -457,7 +598,7 @@ class AsymMGCDecoder:
         from reedsolo import RSCodec
 
         # Strip markers from candidates for RS checking
-        rs_codec = RSCodec(self.decoder.c_rs, c_exp=self.decoder.l)
+        rs_codec = RSCodec(self.c_rs, c_exp=self.l)
         rs_nonzero = True
 
         for dna_candidate, _ in candidates:

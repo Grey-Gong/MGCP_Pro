@@ -363,7 +363,10 @@ class FSMJointDecoder:
         next_states, stats
         """
         next_states: Dict[FSMViterbiState, FSMPathMetricTopK] = {}
-        stats = {'transitions': 0, 'pruned': 0}
+        stats = {'transitions': 0, 'pruned': 0, 'candidates': 0, 'active_groups': 0}
+
+        for state, pm_topk in states.items():
+            stats['candidates'] += len(pm_topk)
 
         for state, pm_topk in states.items():
             for prev_pm in pm_topk.get_all():
@@ -428,6 +431,7 @@ class FSMJointDecoder:
             next_states = self.prune_threshold(next_states)
 
         stats['pruned'] = sum(1 for s in next_states.values() if len(s) == 0)
+        stats['active_groups'] = len(next_states)
 
         # Track best PM per state (for traceback diagnostics)
         for state, topk in next_states.items():
@@ -547,3 +551,40 @@ class FSMJointDecoder:
             candidates.append((dna, pm.log_prob))
 
         return candidates
+
+    def traceback(
+        self,
+        states: Dict[FSMViterbiState, FSMPathMetricTopK],
+    ) -> Tuple[str, float, Optional[FSMViterbiState]]:
+        """
+        Trace back the best path from terminal states.
+
+        Returns (decoded_dna, log_prob, final_state) or ('', -inf, None) if empty.
+        """
+        if not states:
+            return '', -np.inf, None
+
+        best_state = max(
+            states.keys(),
+            key=lambda s: states[s].get_best().log_prob if states[s].get_best() else -np.inf
+        )
+        best_pm = states[best_state].get_best()
+        if best_pm is None:
+            return '', -np.inf, None
+
+        decoded = self.traceback_path(best_pm)
+        return decoded, best_pm.log_prob, best_state
+
+    def _compute_branch_metrics(
+        self,
+        transition: str,
+        emitted_base: int,
+        observed_base: int,
+        phred_quality: float,
+    ) -> float:
+        """
+        Compute branch metric for a transition.
+
+        Alias for branch_metric() for API compatibility.
+        """
+        return self.branch_metric(transition, emitted_base, observed_base, phred_quality)
