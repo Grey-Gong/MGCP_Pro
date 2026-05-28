@@ -1,0 +1,66 @@
+---
+description: Auto-commit all changes to git after each significant task
+alwaysApply: true
+---
+
+# Git Auto-Commit Rule
+
+**CRITICAL: After completing any significant code change, you MUST commit to git immediately.**
+
+## Workflow
+
+After every non-trivial change (new feature, bug fix, refactor, doc update):
+
+1. Run `git status` to see what changed
+2. Run `git diff` to review changes
+3. If changes look correct, run:
+
+```bash
+git add .
+git commit -m "type: brief description"
+git push
+```
+
+## Commit Message Format
+
+```
+type: short description
+
+[type] options:
+  feat    - new feature or functionality
+  fix     - bug fix
+  refactor - code restructuring (no behavior change)
+  docs    - documentation only
+  test    - adding or updating tests
+  style   - formatting, whitespace (no code change)
+  chore   - maintenance, dependencies, build config
+```
+
+## Examples
+
+```
+feat: add BCJR soft-decision decoder
+
+fix: resolve CRC mismatch between encoder and decoder
+
+refactor: simplify sliding window initialization
+
+docs: update IMPROVEMENT_PLAN.md with JCAD design
+```
+
+## When to Commit
+
+- **MUST commit**: After implementing a new module, fixing a bug, or making architectural changes
+- **MUST commit**: Before ending any session where code was modified
+- **OPTIONAL**: After trivial changes (fixing typos, minor formatting)
+
+## Push After Commit
+
+Always run `git push` after commit to sync to remote (github.com/Grey-Gong/MGCP_Pro).
+
+## Rollback Safety
+
+If a commit was made with errors, do NOT amend it. Instead:
+1. Create a new commit that reverts or fixes the error
+2. Push the new commit
+3. This preserves the git history and is safer for collaboration

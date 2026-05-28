@@ -1,0 +1,65 @@
+---
+description: Project overview and architecture for Asym-MGC DNA storage
+alwaysApply: true
+---
+
+# Asym-MGC Project Overview
+
+## What This Project Is
+
+Asym-MGC (Asymmetric Marker-Genie Code) is a DNA storage error-correcting code optimized for Nanopore sequencing platforms.
+
+**Goal**: Achieve FER ~10^-6 from ~10^-3 input error rate, with polynomial (not combinatorial) decoding complexity.
+
+**Target**: IEEE TCOM or equivalent journal paper.
+
+## Key Architecture (v2.1)
+
+### Encoding Pipeline
+```
+Message bits → RS_encode (GF(256)) → CRC-8 → Homopolymer constraint (max_run=4, deterministic) → GC balance → Strong markers (TACGTA)
+```
+
+### Channel Model
+```
+Nanopore: Pd=0.5 (deletion), Pi=0.026 (insertion), Ps=0.474 (substitution)
+```
+
+### Decoding Pipeline
+```
+Pre-decode consensus → FSM-Trellis Viterbi → BCJR fallback → RS syndrome check
+```
+
+### Core Decoders
+- `inner/encode.py`: ConstrainedRSEncoder — RS + CRC + homopolymer constraint
+- `inner/fsm_joint.py`: FSMJointDecoder — FSM-Trellis Viterbi with joint state `(i, Δ, β, γ, S_hp)`
+- `inner/bcjr.py`: BCJR soft-decision decoder (fallback)
+- `inner/decode.py`: AsymMGCDecoder — sliding window + List Viterbi
+- `pipeline.py`: DNAPipeline — full encode→channel→decode pipeline
+
+### Joint State Space
+```
+s = (i, Δ, β, γ, S_hp)
+  i     — input symbol index (0..N)
+  Δ     — net drift [−D_max, +I_max] (asymmetric: D_max >> I_max)
+  β     — block offset (mod l)
+  γ     — CRC syndrome (0..255)
+  S_hp  — homopolymer run length (0..4)
+```
+
+## Known Issues (v2.1)
+
+- Viterbi tends to "copy" rather than "correct" in high-error channels (branch metric design)
+- Consensus pre-decode introduces errors that RS cannot recover at nanopore error rates
+- List Viterbi candidate selection fails without zero-syndrome paths
+
+## Long-Term Direction
+
+JCAD (Joint Consensus and Decoding): iterate E-step/M-step to jointly optimize consensus and decoding, inspired by HEDGES and Yan Court et al.
+
+## Key Files
+
+- `IMPROVEMENT_PLAN.md` — full project roadmap and design decisions
+- `ARCHITECTURE_REVISION_v2_1.md` — v2.1 architecture changes and rationale
+- `BUG_REPORT_AND_FIXES.md` — known bugs and fix strategies
+- `asym_mgc/utils/crc_utils.py` — unified CRC-8 computation (single source of truth)
