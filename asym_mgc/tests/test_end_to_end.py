@@ -288,8 +288,10 @@ class TestSoftInformationPipeline:
         _, info_zero = dec.decode(seq, quality=q_zero)
         _, info_no_q = dec.decode(seq, quality=None)
 
-        # Should be similar (both treated as LLR=0)
-        assert info_zero['total_log_prob'] == info_no_q['total_log_prob']
+        # quality=0 gives uniform LLRs (all paths similar), quality=None uses phred=30
+        # (high confidence), so no-quality should have higher log probability.
+        # This test verifies the new behavior: no quality → phred=30 (discriminative).
+        assert info_no_q['total_log_prob'] > info_zero['total_log_prob']
 
 
 # =============================================================================

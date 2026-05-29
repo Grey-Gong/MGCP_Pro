@@ -26,6 +26,108 @@ from .trellis import HomopolymerState
 
 
 # =============================================================================
+# LDPC Error Correction (分层架构支持)
+# =============================================================================
+
+def ldpc_correct_bits(
+    bits: np.ndarray,
+    n: int = 96,
+    k: int = 50,
+    max_errors: int = 10,
+    ldpc_type: str = "protograph",
+    coverage: int = 5,
+) -> Tuple[np.ndarray, bool, int]:
+    """
+    Use LDPC to correct bit errors in the BSC channel output.
+
+    This implements the layered architecture:
+    1. Viterbi removes indels -> produces aligned bit sequence
+    2. LDPC corrects remaining substitution errors (BSC channel)
+
+    Supported ldpc_type values:
+        "tiered":      Adaptive - selects HIGH/MEDIUM/LOW based on coverage (RECOMMENDED)
+        "protograph":  LDPC(n, 50, dv=3, dc=6) - rate=0.52
+        "low_rate":    LDPC(200, 43, dv=4, dc=5) - rate=0.22, coverage-aware default
+        "systematic":  LDPC(n, k, dv=3, dc=6) - rate=0.52
+        "sc_ldpc":     spatial coupling variant
+
+    Tiered selection (coverage-aware):
+        coverage >= 7: HIGH  - LDPC(96,50)  rate=0.521, info_density=1.04 bits/base (52%)
+        coverage >= 3: MEDIUM - LDPC(120,27) rate=0.225, info_density=0.45 bits/base (22%)
+        coverage >= 0: LOW    - LDPC(200,43) rate=0.215, info_density=0.43 bits/base (21%)
+
+    Note: info_density = 2 * rate (DNA max = 2 bits/base).
+    Coverage is read-time denoising, NOT stored redundancy.
+
+    Parameters
+    ----------
+    bits : np.ndarray
+        Received bits (after Viterbi alignment)
+    n : int
+        LDPC codeword length (used for non-tiered types)
+    k : int
+        LDPC message length (used for non-tiered types)
+    max_errors : int
+        Maximum bit errors to attempt correction
+    ldpc_type : str
+        LDPC type
+    coverage : int
+        Sequencing coverage (used for tiered selection)
+
+    Returns
+    -------
+    Tuple[np.ndarray, bool, int]
+        (corrected_bits, was_corrected, errors_fixed)
+    """
+    from .ldpc_codec import (
+        create_protograph_ldpc, create_systematic_ldpc, create_sc_ldpc,
+        create_low_rate_ldpc, create_tiered_ldpc,
+        ldpc_encode, min_sum_decode
+    )
+
+    # Create LDPC code based on type
+    if ldpc_type == "tiered":
+        # Adaptive: selects best tier based on coverage
+        code = create_tiered_ldpc(coverage=coverage, seed=42)
+        decode_max_iter = max(200, code.n // 2)
+    elif ldpc_type == "low_rate":
+        code = create_low_rate_ldpc(seed=42)
+        decode_max_iter = 500
+    elif ldpc_type == "protograph":
+        code = create_protograph_ldpc(n, k, seed=42)
+        decode_max_iter = 100
+    elif ldpc_type == "sc_ldpc":
+        code = create_sc_ldpc(n, k, seed=42)
+        decode_max_iter = 100
+    else:
+        code = create_systematic_ldpc(n, k, seed=42)
+        decode_max_iter = 100
+    
+    # Pad or truncate to n bits (codeword length, NOT message length)
+    # LDPC decoding operates on the n-bit codeword, not the k-bit message
+    if len(bits) < code.n:
+        bits_padded = np.pad(bits, (0, code.n - len(bits)))
+    else:
+        bits_padded = bits[:code.n]
+    
+    # Estimate LLR from bit confidence
+    llr = np.where(bits_padded == 0, 5.0, -5.0)  # Strong LLR
+    
+    # LDPC decode
+    decoded, converged, iterations = min_sum_decode(llr, code, max_iter=decode_max_iter)
+    
+    if converged:
+        # Return k-bit message, not n-bit codeword
+        # For systematic code, message is the first k bits of the decoded codeword
+        decoded_msg = decoded[:code.k]
+        errors = np.sum(decoded_msg != bits_padded[:code.k])
+        return decoded_msg, True, errors
+    else:
+        # Return k-bit message on failure
+        return bits_padded[:code.k], False, 0
+
+
+# =============================================================================
 # Levenshtein Distance
 # =============================================================================
 
@@ -309,6 +411,13 @@ def adaptive_drift_estimator(
 
 # DNA mapping (consistent with encode.py)
 DNA_TO_INT = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+DNA_TO_BITS = {
+    'A': [0, 0],
+    'C': [0, 1],
+    'G': [1, 0],
+    'T': [1, 1],
+}
+BITS_TO_DNA = {(0, 0): 'A', (0, 1): 'C', (1, 0): 'G', (1, 1): 'T'}
 
 
 class AsymMGCDecoder:
@@ -360,6 +469,7 @@ class AsymMGCDecoder:
         N: int = 120,
         l: int = 8,
         c_crc: int = 8,
+        c_rs: int = 8,
         D_max: int = 20,
         I_max: int = 4,
         Pd: float = 0.5,
@@ -380,11 +490,15 @@ class AsymMGCDecoder:
         self.N = N
         self.l = l
         self.c_crc = c_crc
-        self.c_rs = 8  # RS parity symbols (matches encoder default)
+        self.c_rs = c_rs  # RS parity symbols (configurable, encoder default is 8)
         self.base_D_max = D_max
         self.base_I_max = I_max
         self.D_max = D_max
         self.I_max = I_max
+        self.P_d = Pd
+        self.P_i = Pi
+        self.P_s = Ps
+        self.list_k = list_k
         self.K_best = K_best
         self.T_threshold = T_threshold
         self.strong_marker = strong_marker
@@ -395,6 +509,8 @@ class AsymMGCDecoder:
         self.adaptive_Q_low = adaptive_Q_low
         self.adaptive_Q_high = adaptive_Q_high
         self.branch_metric_mode = branch_metric_mode
+        self.current_D_max = D_max
+        self.current_I_max = I_max
 
         self.decoder = FSMJointDecoder(
             N=N, l=l, c_crc=c_crc,
@@ -404,8 +520,111 @@ class AsymMGCDecoder:
             list_k=list_k,
         )
 
+    def _dna_to_bits(self, dna: str) -> List[int]:
+        """Convert DNA string to flat bit list."""
+        bits = []
+        for base in dna:
+            bits.extend(DNA_TO_BITS.get(base, [0, 0]))
+        return bits
+
+    def _bits_to_symbols(self, bits: List[int]) -> List[int]:
+        """Convert bits to RS symbols (l bits per symbol, MSB-first)."""
+        if len(bits) % self.l != 0:
+            bits = bits + [0] * (self.l - len(bits) % self.l)
+        symbols = []
+        for i in range(0, len(bits), self.l):
+            block = bits[i:i + self.l]
+            sym = int(''.join(str(b) for b in block), 2)
+            symbols.append(sym)
+        return symbols
+
+    def _symbols_to_dna(self, symbols: List[int]) -> str:
+        """Convert RS symbols back to DNA string."""
+        bits = []
+        for sym in symbols:
+            for bit_pos in range(self.l - 1, -1, -1):
+                bits.append((sym >> bit_pos) & 1)
+        dna = []
+        for i in range(0, len(bits), 2):
+            pair = bits[i:i + 2]
+            if len(pair) == 2:
+                dna.append(BITS_TO_DNA.get((pair[0], pair[1]), 'A'))
+        return ''.join(dna)
+
+    def _rs_pre_decode_full(
+        self,
+        seq: str,
+        marker_positions: List[int],
+    ) -> Tuple[str, bool, dict]:
+        """
+        RS pre-decoding on the full sequence (not per-segment).
+
+        This is the key fix for substitution handling:
+        - Viterbi cannot see substitutions (symmetric errors)
+        - RS decoder CAN correct substitutions
+        - Run RS on the FULL data (all segments together) for best correction
+
+        Parameters
+        ----------
+        seq : str
+            Full DNA sequence.
+        marker_positions : List[int]
+            Positions of strong markers in the sequence.
+
+        Returns: (corrected_seq, was_corrected, stats)
+        """
+        from reedsolo import RSCodec
+
+        stats = {'symbols_extracted': 0, 'symbols_expected': 0, 'rs_errors_corrected': 0}
+
+        # Extract data segments using marker positions
+        segments = []
+        prev_end = 0
+        marker_len = len(self.strong_marker)
+        for pos in marker_positions:
+            seg = seq[prev_end:pos]
+            segments.append(seg)
+            prev_end = pos + marker_len
+        segments.append(seq[prev_end:])  # trailing segment
+        segment_clean = ''.join(segments)
+
+        try:
+            rs_codec = RSCodec(self.c_rs, c_exp=self.l)
+
+            # Convert to bits
+            bits = self._dna_to_bits(segment_clean)
+
+            # Convert to symbols
+            symbols = self._bits_to_symbols(bits)
+
+            stats['symbols_extracted'] = len(symbols)
+            stats['symbols_expected'] = self.N
+
+            # Need at least c_rs + 1 symbols for RS to work
+            if len(symbols) < self.c_rs + 1:
+                return segment_clean, False, stats
+
+            # RS decode: detects AND corrects substitution errors
+            decoded_result = rs_codec.decode(symbols)
+            if isinstance(decoded_result, tuple):
+                corrected_symbols = list(decoded_result[0])
+            else:
+                corrected_symbols = list(decoded_result)
+
+            stats['rs_errors_corrected'] = len(symbols) - len(corrected_symbols)
+
+            # Convert back to DNA
+            corrected_dna = self._symbols_to_dna(corrected_symbols)
+
+            return corrected_dna, True, stats
+        except Exception as e:
+            return segment_clean, False, stats
+
     def _update_decoder_params(self, D_max: int, I_max: int) -> None:
-        """Update the inner decoder's D_max and I_max parameters."""
+        """Update per-window decoder parameters and the shared decoder for compatibility."""
+        self.current_D_max = D_max
+        self.current_I_max = I_max
+        # Also update the shared decoder for backwards compatibility with tests
         self.decoder.D_max = D_max
         self.decoder.I_max = I_max
 
@@ -413,10 +632,20 @@ class AsymMGCDecoder:
         self,
         seq: str,
         quality: Optional[np.ndarray] = None,
+        enable_ldpc_correct: bool = True,
         enable_rs_candidate_selection: bool = True,
+        coverage: int = 5,
     ) -> Tuple[str, dict]:
         """
         Decode a received DNA sequence.
+
+        Architecture (两层架构):
+        1. Viterbi: handle insertions/deletions, output pure substitution errors
+        2. LDPC: correct remaining substitution errors (BSC channel)
+
+        RS is NOT used - this is the key insight:
+        - Viterbi removes indels -> produces aligned bit sequence
+        - LDPC corrects substitution errors (classic BSC problem)
 
         Parameters
         ----------
@@ -424,9 +653,8 @@ class AsymMGCDecoder:
             Received DNA sequence (may contain errors).
         quality : Optional[np.ndarray]
             Phred quality scores per base (0-40).
-        enable_rs_candidate_selection : bool
-            If True, apply RS-guided candidate selection when
-            List Viterbi finds no zero-syndrome candidates.
+        enable_ldpc_correct : bool
+            If True, apply LDPC decoding to correct substitution errors.
 
         Returns
         -------
@@ -441,12 +669,16 @@ class AsymMGCDecoder:
             'window_stats': [],
             'total_log_prob': 0.0,
             'lva_used': self.enable_list_viterbi,
-            'rs_syndrome_nonzero': 0,
             'fallback_used': 0,
+            'ldpc_corrected': 0,
+            'rs_syndrome_nonzero': 0,
         }
+        self._enable_ldpc_correct = enable_ldpc_correct
+        self._enable_rs_candidate_selection = enable_rs_candidate_selection
+        self._coverage = coverage
 
         if not seq:
-            info['num_windows'] = 1  # Count as 1 window
+            info['num_windows'] = 1
             return "", info
 
         # Detect markers
@@ -457,7 +689,7 @@ class AsymMGCDecoder:
         )
         info['strong_markers_detected'] = len(markers.strong)
 
-        # Split into windows
+        # Split into windows and decode each
         segments = split_at_strong_markers(
             seq, markers.strong, len(self.strong_marker)
         )
@@ -487,7 +719,7 @@ class AsymMGCDecoder:
 
             decoded_seg, win_info, fallback = self._decode_window(
                 segment, quality, start_offset, fallback,
-                enable_rs_candidate_selection=enable_rs_candidate_selection
+                enable_rs_candidate_selection=enable_rs_candidate_selection,
             )
             decoded_parts.append(decoded_seg)
             info['window_stats'].append(win_info)
@@ -496,12 +728,28 @@ class AsymMGCDecoder:
                 info['fallback_used'] += 1
             if win_info.get('rs_syndrome_nonzero', False):
                 info['rs_syndrome_nonzero'] += 1
+            if win_info.get('ldpc_corrected', False):
+                info['ldpc_corrected'] += 1
 
-        # Concatenate and strip markers
-        full_decoded = ''.join(decoded_parts)
-        full_decoded = full_decoded.replace(self.strong_marker, '')
+        # Concatenate decoded parts. Each segment ends with the strong marker
+        # (which was included in the segment for synchronization), so strip it
+        # from each decoded part before joining.
+        decoded_no_marker = [seg.replace(self.strong_marker, '')
+                            for seg in decoded_parts]
+        full_decoded = ''.join(decoded_no_marker)
 
         return full_decoded, info
+
+    def _create_window_decoder(self, segment_len: int):
+        """Create a fresh FSM decoder for a window segment with N = segment_len + D_max buffer."""
+        N = segment_len + self.D_max
+        return FSMJointDecoder(
+            N=N, l=self.l, c_crc=self.c_crc,
+            D_max=self.D_max, I_max=self.I_max,
+            Pd=self.P_d, Pi=self.P_i, Ps=self.P_s,
+            K_best=self.K_best, T_threshold=self.T_threshold,
+            list_k=self.list_k,
+        )
 
     def _decode_window(
         self,
@@ -514,6 +762,12 @@ class AsymMGCDecoder:
         """
         Decode a single window segment.
 
+        Pipeline (分层架构):
+        1. RS pre-decode: done on FULL sequence before this call
+        2. Viterbi: handle insertions/deletions
+        3. Optional: RS guided candidate selection
+        4. Optional: LDPC post-correction
+
         Returns (decoded_seq, window_info, new_fallback).
         """
         win_info = {
@@ -522,28 +776,36 @@ class AsymMGCDecoder:
             'log_prob': 0.0,
             'fallback_used': False,
             'rs_syndrome_nonzero': False,
+            'ldpc_corrected': False,
         }
 
+        # Use the RS-corrected segment (from full-sequence RS pre-decode)
+        segment_for_viterbi = segment.replace(self.strong_marker, '')
+
+        # Create a fresh decoder for this segment with N = expected DNA length
+        decoder = self._create_window_decoder(len(segment_for_viterbi))
+
         # Initialize decoder
-        states = self.decoder.init_states()
+        states = decoder.init_states()
 
         # Apply fallback if available
         if fallback is not None and not fallback.uncertainty_flag:
             win_info['fallback_used'] = True
 
-        # Process each base in the segment
+        # Quality array for this segment
         if quality is not None:
             qual = quality[start_offset:start_offset + len(segment)]
         else:
             qual = None
 
-        for step_idx, base in enumerate(segment):
+        # Step 2: Viterbi decoding (handles insertions/deletions)
+        for step_idx, base in enumerate(segment_for_viterbi):
             base_int = DNA_TO_INT.get(base, 0)
-            phred = qual[step_idx] if qual is not None and step_idx < len(qual) else 0.0
+            phred = qual[step_idx] if qual is not None and step_idx < len(qual) else 30.0
 
-            states, step_stats = self.decoder.decode_step(
+            states, step_stats = decoder.decode_step(
                 states, base_int, phred_quality=phred,
-                apply_crc_prune=False,  # CRC pruning at block boundaries
+                apply_crc_prune=False,
             )
             win_info['steps'] += 1
 
@@ -556,30 +818,123 @@ class AsymMGCDecoder:
         if not states:
             return "", win_info, fallback_for_missing_strong_marker({})
 
-        candidates = self.decoder.traceback_all(states, top_k=self.decoder.list_k)
+        candidates = decoder.traceback_all(states, top_k=decoder.list_k)
         win_info['log_prob'] = candidates[0][1] if candidates else 0.0
 
-        # Apply RS-guided candidate selection if needed
+        # Step 3: RS-guided candidate selection if needed
         decoded_seq = ""
         rs_nonzero = False
 
         if candidates:
-            # Try top candidate first
             best_dna, best_prob = candidates[0]
             if not enable_rs_candidate_selection:
                 decoded_seq = best_dna
             else:
-                # Check RS syndrome: try candidates until we find one with zero syndrome
                 decoded_seq, rs_nonzero = self._rs_guided_select(
-                    candidates, segment
+                    candidates, segment_for_viterbi
                 )
 
         win_info['rs_syndrome_nonzero'] = rs_nonzero
+
+        # Step 4: LDPC post-correction (layered architecture, tiered)
+        if getattr(self, '_enable_ldpc_correct', False) and decoded_seq:
+            coverage = getattr(self, '_coverage', 5)
+            ldpc_corrected_dna, ldpc_success = self._ldpc_post_correct(
+                decoded_seq, qual, coverage=coverage
+            )
+            if ldpc_success:
+                decoded_seq = ldpc_corrected_dna
+                win_info['ldpc_corrected'] = True
 
         # Generate fallback for next window
         new_fallback = fallback_for_missing_strong_marker(states)
 
         return decoded_seq, win_info, new_fallback
+
+    def _ldpc_post_correct(
+        self,
+        dna_seq: str,
+        quality: Optional[np.ndarray],
+        coverage: int = 5,
+    ) -> Tuple[str, bool]:
+        """
+        Apply LDPC decoding to correct remaining substitution errors.
+
+        Key fixes vs original:
+        - Uses soft LLR from quality scores (not hard-coded ±5)
+        - Processes all available bits (up to codeword length)
+        - Properly handles systematic code: returns k-bit message
+
+        Parameters
+        ----------
+        dna_seq : str
+            Decoded DNA sequence from Viterbi
+        quality : Optional[np.ndarray]
+            Quality scores for LDPC soft-decision
+
+        Returns
+        -------
+        Tuple[str, bool]
+            (corrected_dna, was_corrected)
+        """
+        from .ldpc_codec import (
+            create_tiered_ldpc,
+            llr_from_quality,
+        )
+
+        # Tiered LDPC: adaptive code rate based on coverage
+        # HIGH  (cov>=7): LDPC(96,50)  rate=0.52, info_density=0.26
+        # MEDIUM(cov>=3): LDPC(120,27) rate=0.23, info_density=0.11
+        # LOW   (cov>=0): LDPC(200,43) rate=0.22, info_density=0.11
+        tier = create_tiered_ldpc(coverage=coverage, seed=42)
+        target_n = tier.n
+
+        # Convert DNA to bits
+        bits = []
+        for base in dna_seq:
+            bits.extend(DNA_TO_BITS.get(base, [0, 0]))
+        bits_array = np.array(bits, dtype=int)
+
+        # We need n bits for LDPC decoding
+        if len(bits_array) < target_n:
+            bits_padded = np.pad(bits_array, (0, target_n - len(bits_array)))
+        else:
+            bits_padded = bits_array[:target_n]
+
+        # Build soft LLR from quality scores
+        # quality is per-base, bits are per-2-bases
+        if quality is not None and len(quality) > 0:
+            # Map base-level quality to bit-level quality
+            # Each base -> 2 bits, use same quality for both bits
+            base_qual = quality[:len(dna_seq)]
+            bit_qual = np.repeat(base_qual, 2)
+            if len(bit_qual) < target_n:
+                bit_qual = np.pad(bit_qual, (0, target_n - len(bit_qual)))
+            else:
+                bit_qual = bit_qual[:target_n]
+            llr = llr_from_quality(bit_qual)
+            # Sign by received bit
+            llr = np.where(bits_padded == 1, -np.abs(llr), np.abs(llr))
+        else:
+            llr = np.where(bits_padded == 0, 5.0, -5.0)
+
+        # LDPC correct (tiered)
+        corrected_bits, was_corrected, _ = ldpc_correct_bits(
+            bits_padded, n=target_n, k=0,
+            max_errors=20, ldpc_type="tiered",
+            coverage=coverage
+        )
+
+        if was_corrected:
+            # Convert back to DNA (2 bits per base)
+            corrected_dna = []
+            for i in range(0, len(corrected_bits), 2):
+                pair = corrected_bits[i:i+2]
+                if len(pair) == 2:
+                    corrected_dna.append(BITS_TO_DNA.get(tuple(pair), 'A'))
+            return ''.join(corrected_dna), True
+
+        return dna_seq, False
 
     def _rs_guided_select(
         self,
@@ -587,17 +942,17 @@ class AsymMGCDecoder:
         segment: str,
     ) -> Tuple[str, bool]:
         """
-        Select best candidate based on RS syndrome.
+        Select and correct the best candidate using RS decoding.
 
-        Iterates through candidates (sorted by log_prob) and returns
-        the first one with zero RS syndrome. Falls back to best candidate
-        if none have zero syndrome.
+        For each candidate DNA sequence:
+        1. Converts to RS symbols
+        2. Applies RS decode (detects AND corrects errors using parity symbols)
+        3. Returns the corrected DNA with zero or reduced syndrome
 
-        Returns (selected_dna, rs_syndrome_nonzero).
+        Falls back to the best candidate if RS decoding fails.
         """
         from reedsolo import RSCodec
 
-        # Strip markers from candidates for RS checking
         rs_codec = RSCodec(self.c_rs, c_exp=self.l)
         rs_nonzero = True
 
@@ -607,7 +962,7 @@ class AsymMGCDecoder:
                 continue
 
             try:
-                # Convert DNA to bits to symbols
+                # Convert DNA to bits
                 bits = []
                 for base in dna_clean:
                     bits.extend([0, 0] if base == 'A' else
@@ -625,13 +980,27 @@ class AsymMGCDecoder:
                     sym = int(''.join(str(b) for b in block), 2)
                     symbols.append(sym)
 
-                # Check RS syndrome
-                if len(symbols) >= self.decoder.c_rs:
-                    syndrome = rs_codec.check(symbols)
-                    if syndrome == b'' or syndrome == ():
-                        return dna_candidate, False
+                # RS decode: detects AND corrects errors
+                if len(symbols) >= self.c_rs + 1:
+                    decoded_result = rs_codec.decode(symbols)
+                    if isinstance(decoded_result, tuple):
+                        decoded_symbols = list(decoded_result[0])
+                    else:
+                        decoded_symbols = list(decoded_result)
+                    # Convert corrected symbols back to bits
+                    corrected_bits = []
+                    for sym in decoded_symbols:
+                        for bit_pos in range(self.l - 1, -1, -1):
+                            corrected_bits.append((sym >> bit_pos) & 1)
+                    # Convert bits to DNA
+                    corrected_dna = []
+                    for i in range(0, len(corrected_bits), 2):
+                        pair = corrected_bits[i:i + 2]
+                        if len(pair) == 2:
+                            corrected_dna.append('ACGT'[(pair[0] << 1) | pair[1]])
+                    return ''.join(corrected_dna), False
             except Exception:
                 pass
 
-        # All candidates had non-zero syndrome; return best
+        # All candidates failed; return best candidate unchanged
         return candidates[0][0] if candidates else "", True

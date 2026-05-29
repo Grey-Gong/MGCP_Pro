@@ -199,8 +199,11 @@ class TestFSMJointDecoder:
         """Test CRC early termination pruning."""
         dec = FSMJointDecoder(N=120, l=8, c_crc=8, D_max=20, I_max=4)
 
+        # CRC boundary: beta==0 AND i >= l (first l=8 steps complete).
+        # After exactly l steps, beta wraps back to 0. So boundaries at i=8,16,24,...
+        # Note: i=0,beta=0 is the initial state (before any step) - not a boundary.
         states = {}
-        for i in range(5):
+        for i in [8, 16]:  # CRC block boundaries
             for gamma in [0, 17, 42]:  # 0 = valid CRC, others invalid
                 s = FSMViterbiState(
                     i=i, delta=0, beta=0, gamma=gamma,
@@ -211,11 +214,34 @@ class TestFSMJointDecoder:
                 topk.add(pm)
                 states[s] = topk
 
+        # Also add non-boundary states (should NOT be pruned)
+        for i, beta in [(7, 7), (4, 4), (3, 3), (0, 0)]:
+            s = FSMViterbiState(
+                i=i, delta=0, beta=beta, gamma=42,
+                s_hp=HPState.NONE, prev_base=-1
+            )
+            pm = FSMPathMetric(log_prob=float(-i), prev_state=None, transition='MATCH')
+            topk = FSMPathMetricTopK(list_k=dec.list_k)
+            topk.add(pm)
+            states[s] = topk
+
         pruned = dec.prune_crc(states)
 
-        # Only gamma=0 states should survive
+        # Only gamma=0 states at CRC block boundaries survive.
+        # All non-boundary states (even with gamma!=0) must survive.
         for s in pruned:
-            assert s.gamma == 0
+            at_boundary = (s.beta == 0) and (s.i >= dec.l)
+            if at_boundary:
+                assert s.gamma == 0, f"gamma={s.gamma} should be 0 at boundary i={s.i}"
+
+        # All boundary states with gamma!=0 must be pruned (not present in pruned)
+        boundary_bad = sum(1 for s in pruned
+                          if (s.beta == 0) and (s.i >= dec.l) and (s.gamma != 0))
+        assert boundary_bad == 0, f"Bad CRC states survived at boundaries: {boundary_bad}"
+
+        # Boundary states with gamma==0 must survive
+        boundary_good = sum(1 for s in pruned if (s.beta == 0) and (s.i >= dec.l) and (s.gamma == 0))
+        assert boundary_good == 2, f"Expected 2 boundary states with good CRC, got {boundary_good}"
 
     def test_branch_metric_match(self):
         """Test branch metric for MATCH transitions."""

@@ -88,6 +88,10 @@ encoding_params.json
 mgcp_encode_meta.json
 clustering_stats.txt
 error_rate_vs_coderate*.txt
+EXPERIMENT_RECORD*.md
+
+# Documentation (can be rebuilt)
+docs/
 
 # Experiments (can be regenerated)
 experiments/*.py

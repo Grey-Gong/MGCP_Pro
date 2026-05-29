@@ -78,8 +78,6 @@ class TrellisCol:
     def __post_init__(self):
         if self.log_beta is None:
             self.log_beta = np.full(len(self.states), LOG_ZERO)
-        if self.log_gamma_matrix is None:
-            self.log_gamma_matrix = np.full((len(self.states), len(self.states)), LOG_ZERO)
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,7 @@ from .outer.outer_soft import (
     soft_consensus,
     gmd_osd_rs_decode,
     extrinsic_information_transfer,
+    _align_pairwise,
 )
 
 
@@ -369,6 +370,7 @@ class DNAPipeline:
         self,
         seq: str,
         quality: Optional[np.ndarray] = None,
+        coverage: int = 5,
     ) -> StrandResult:
         """
         Decode a single strand using the inner FSM-Viterbi decoder.
@@ -379,13 +381,17 @@ class DNAPipeline:
             Received DNA sequence.
         quality : Optional[np.ndarray]
             Phred quality scores.
+        coverage : int
+            Sequencing coverage (passed to LDPC tiered selection).
 
         Returns
         -------
         StrandResult
             Decoding result.
         """
-        decoded, info = self.decoder.decode(seq, quality=quality)
+        decoded, info = self.decoder.decode(
+            seq, quality=quality, coverage=coverage
+        )
 
         return StrandResult(
             dna_decoded=decoded,
@@ -402,6 +408,7 @@ class DNAPipeline:
         strands: List[Tuple[str, np.ndarray]],
         use_outer: bool = False,
         outer_iterations: int = 3,
+        coverage: int = 5,
     ) -> Tuple[str, dict]:
         """
         Full decode of multiple strands.
@@ -414,17 +421,14 @@ class DNAPipeline:
             If True, apply outer soft-decision RS decoding.
         outer_iterations : int
             Number of extrinsic IT iterations.
-
-        Returns
-        -------
-        decoded : str
-            Final decoded DNA sequence.
-        info : dict
-            Decoding statistics.
+        coverage : int
+            Number of strands (for LDPC tiered selection).
+            Recommended: coverage >= 7 for HIGH tier, >= 3 for MEDIUM.
         """
         info = {
             'num_strands': len(strands),
             'strand_stats': [],
+            'coverage': coverage,
         }
 
         if not strands:
@@ -433,7 +437,7 @@ class DNAPipeline:
         # Inner decode each strand
         results = []
         for seq, qual in strands:
-            result = self.inner_decode_strand(seq, qual)
+            result = self.inner_decode_strand(seq, qual, coverage=coverage)
             results.append(result)
             info['strand_stats'].append({
                 'log_prob': result.log_prob,
@@ -477,6 +481,177 @@ class DNAPipeline:
             info[f'outer_iter_{it}'] = status
 
         return final_seq, info
+
+    def segmented_consensus_decode(
+        self,
+        strands: List[Tuple[str, np.ndarray]],
+        metadata: dict,
+        tolerance: int = 1,
+        position_tolerance: int = 30,
+        min_reads_per_segment: int = 2,
+    ) -> Tuple[str, dict]:
+        """
+        Segmented consensus decode using anchor-defined boundaries.
+
+        Strategy:
+        1. Extract segments using anchor positions from metadata
+        2. Decode each segment independently from each read
+        3. Vote across reads for each segment
+        4. Concatenate voted segments
+
+        This is more reliable than position-wise voting when reads have
+        different lengths due to indels.
+
+        Parameters
+        ----------
+        strands : List[Tuple[str, np.ndarray]]
+            List of (sequence, quality) tuples.
+        metadata : dict
+            Encoding metadata (must contain anchor_positions).
+        tolerance : int
+            Hamming distance tolerance for anchor matching.
+        position_tolerance : int
+            Maximum deviation from expected anchor position.
+        min_reads_per_segment : int
+            Minimum reads required to vote on a segment.
+
+        Returns
+        -------
+        Tuple[str, dict]
+            (consensus_seq, info_dict).
+        """
+        from .inner.robust_anchors import segmented_consensus_from_reads
+
+        if not strands:
+            return "", {'error': 'no strands'}
+
+        reads = [s for s, _ in strands]
+        qualities = [q for _, q in strands]
+
+        # Convert dataclass metadata to dict for robust_anchors functions
+        meta_dict = {
+            'strong_marker_cycle': metadata.strong_marker_cycle,
+            'anchor_positions': list(metadata.anchor_positions),
+        }
+
+        def fsm_factory(N):
+            return FSMJointDecoder(
+                N=N, l=self.l, c_crc=self.c_crc,
+                D_max=self.D_max, I_max=self.I_max,
+                Pd=self.Pd, Pi=self.Pi, Ps=self.Ps,
+                K_best=self.K_best, T_threshold=self.T_threshold,
+                list_k=self.list_k,
+            )
+
+        consensus, info = segmented_consensus_from_reads(
+            reads, meta_dict, fsm_factory,
+            qualities=qualities,
+            tolerance=tolerance,
+            position_tolerance=position_tolerance,
+            min_reads_per_segment=min_reads_per_segment,
+        )
+
+        return consensus, info
+
+    def raw_base_consensus_decode(
+        self,
+        strands: List[Tuple[str, np.ndarray]],
+        metadata,
+        tolerance: int = 1,
+        position_tolerance: int = 30,
+        min_reads_per_segment: int = 2,
+    ) -> Tuple[str, dict]:
+        """
+        Consensus from raw reads BEFORE Viterbi decoding.
+
+        Correct pipeline order:
+            Raw Reads → Anchor segmentation → NW alignment →
+            Raw base vote → Consensus → Viterbi (single pass)
+
+        This is fundamentally different from full_decode, which applies Viterbi
+        to each read first, then consensus from decoded outputs.
+
+        Parameters
+        ----------
+        strands : List[Tuple[str, np.ndarray]]
+            List of (sequence, quality) tuples.
+        metadata
+            Encoding metadata (EncoderMetadata dataclass).
+        tolerance : int
+            Hamming distance tolerance for anchor matching.
+        position_tolerance : int
+            Maximum deviation from expected anchor position.
+        min_reads_per_segment : int
+            Minimum reads required for a voted segment.
+
+        Returns
+        -------
+        Tuple[str, dict]
+            (consensus_seq, info_dict).
+        """
+        from .inner.robust_anchors import raw_base_consensus_from_reads
+
+        if not strands:
+            return "", {'error': 'no strands'}
+
+        reads = [s for s, _ in strands]
+        qualities = [q for _, q in strands]
+
+        meta_dict = {
+            'strong_marker_cycle': getattr(metadata, 'strong_marker_cycle', ['TAGCG', 'TATCC', 'TGACA']),
+            'anchor_positions': list(getattr(metadata, 'anchor_positions', [])),
+        }
+
+        # Step 1: Raw base consensus (with quality-weighted voting)
+        consensus, raw_info = raw_base_consensus_from_reads(
+            reads, meta_dict,
+            qualities=qualities,
+            tolerance=tolerance,
+            position_tolerance=position_tolerance,
+            min_reads_per_segment=min_reads_per_segment,
+        )
+
+        if not consensus:
+            return "", raw_info
+
+        # Step 2: Iterative consensus refinement
+        # After raw base voting, some substitution errors remain.
+        # Re-align reads to the current consensus, then vote again.
+        # This progressively eliminates substitution errors as consensus improves.
+        final_consensus = consensus
+        n_iterations = 3
+
+        for iteration in range(n_iterations):
+            # Align each read to the current consensus (ref-space)
+            aligned = []
+            for read in reads:
+                a_ref, a_seq = _align_pairwise(final_consensus, read)
+                aligned.append(a_seq)
+
+            # Vote column-wise
+            max_len = max(len(a) for a in aligned)
+            padded = [a.ljust(max_len, '-') for a in aligned]
+            votes = []
+            for pos in range(max_len):
+                counts = {'A': 0, 'C': 0, 'G': 0, 'T': 0}
+                for p in padded:
+                    b = p[pos]
+                    if b in counts:
+                        counts[b] += 1
+                best = max(counts, key=counts.get)
+                if counts[best] < 2:
+                    best = 'N'
+                votes.append(best)
+
+            refined = ''.join(votes).replace('-', '')
+            if refined == final_consensus or len(refined) == 0:
+                break
+            final_consensus = refined
+
+        raw_info['iterations'] = n_iterations
+        raw_info['final_seq'] = final_consensus
+
+        return final_consensus, raw_info
 
     def run(
         self,
@@ -622,4 +797,8 @@ class EncoderMetadata:
     max_run: int = 4
     gc_low: float = 0.40
     gc_high: float = 0.60
-    strong_marker: str = 'TACGTA'
+    strong_marker: str = 'TAGCG'
+    strong_marker_len: int = 5
+    strong_marker_cycle: List[str] = field(default_factory=lambda: ['TAGCG', 'TATCC', 'TGACA'])
+    blocks_per_strong: int = 32
+    anchor_positions: List[int] = field(default_factory=list)

@@ -53,13 +53,17 @@ class TestConstrainedRSEncoder:
         assert meta['K'] == 120
 
     def test_encode_produces_markers(self):
-        """Test that encoded sequence contains strong markers (TACGTA)."""
+        """Test that encoded sequence contains robust anchors (TAGCG/TATCC/TGACA)."""
         encoder = ConstrainedRSEncoder(l=8, c_rs=8, c_crc=8)
         message = create_test_message(960)
         dna, meta = encoder.encode(message)
 
-        # Only strong markers (TACGTA) are inserted now
-        assert 'TACGTA' in dna
+        # Robust anchors cycle: TAGCG -> TATCC -> TGACA
+        # With 960 bits = 120 symbols = 960 bases, should have ~6 anchors
+        anchors_found = sum(dna.count(a) for a in ['TAGCG', 'TATCC', 'TGACA'])
+        assert anchors_found > 0, "No robust anchors found in encoded DNA"
+        assert 'anchor_positions' in meta
+        assert len(meta['anchor_positions']) > 0
 
     def test_encode_deterministic(self):
         """Test that encoding is deterministic (same message -> same output)."""

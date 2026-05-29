@@ -265,12 +265,13 @@ class FSMJointDecoder:
         Enumerate all valid transitions from a given state.
 
         Returns list of (transition_type, emitted_base, next_delta) tuples.
+
+        NOTE: The input_exhausted check was removed. N is used for initial
+        state setup only; the trellis processes all observed bases via MATCH
+        transitions regardless of position. Block-boundary CRC pruning still
+        works via the beta (position-within-symbol) component of the state.
         """
         transitions = []
-
-        # Check if we've processed all input symbols
-        if state.i >= self.N:
-            return transitions
 
         # Check drift bounds
         can_delete = state.delta > -self.D_max
@@ -286,7 +287,7 @@ class FSMJointDecoder:
             else:
                 next_hp = HomopolymerState.SINGLE
 
-            # MATCH transition
+            # MATCH transition (consumes both input and received)
             transitions.append(('MATCH', state.delta, emitted_base))
 
             # DELETION transition (consumes input, doesn't consume received)
@@ -450,11 +451,14 @@ class FSMJointDecoder:
         """
         CRC early-termination: prune non-zero syndrome at block boundaries.
 
-        Strategy A: Only prune when beta == 0 (at block boundary).
+        beta == 0 marks the end of an l-step block (after consuming l bases,
+        beta wraps back to 0). Only prune when i >= l (the first block is
+        complete) to avoid checking before the first CRC computation.
         """
         result = {}
         for state, topk in states.items():
-            if state.beta == 0 and state.gamma != 0:
+            at_boundary = (state.beta == 0) and (state.i >= self.l)
+            if at_boundary and state.gamma != 0:
                 continue  # Prune: CRC violation at block boundary
             result[state] = topk
         return result

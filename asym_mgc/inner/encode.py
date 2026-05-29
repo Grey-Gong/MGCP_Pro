@@ -9,7 +9,7 @@ Encoding pipeline (revised v2.1):
   5. Convert to DNA bits
   6. Homopolymer constraint (max_run, deterministic, no metadata needed)
   7. GC balance (bit-level correction, reversible)
-  8. Insert strong markers only (TACGTA, no weak markers)
+  8. Insert robust 5-mer anchors cycling: TAGCG -> TATCC -> TGACA -> ...
 
 Reference: IMPROVEMENT_PLAN.md v2.1 + ARCHITECTURE_REVISION_v2_1.md.
 """
@@ -22,6 +22,7 @@ import numpy as np
 from reedsolo import RSCodec
 
 from ..utils.crc_utils import crc8_batch
+from .robust_anchors import DEFAULT_ANCHORS, ANCHOR_LEN
 
 
 # DNA binary mapping
@@ -36,9 +37,13 @@ DNA_COMPLEMENT = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
 
 INT_TO_DNA = ['A', 'C', 'G', 'T']
 
-# Strong marker only (no weak markers)
-STRONG_MARKER = 'TACGTA'
-STRONG_MARKER_LEN = 6
+# ---------------------------------------------------------------------------
+# Strong markers (robust 5-mer anchors, CHN-inspired)
+# ---------------------------------------------------------------------------
+
+STRONG_MARKER = DEFAULT_ANCHORS[0]  # 'TAGCG' — most robust anchor
+STRONG_MARKER_LEN = ANCHOR_LEN  # 5
+STRONG_MARKER_CYCLE = DEFAULT_ANCHORS  # ['TAGCG', 'TATCC', 'TGACA']
 
 
 def binary_to_dna(bits: List[int]) -> str:
@@ -186,9 +191,9 @@ def apply_gc_balance_idempotent(bits: List[int], gc_low: float = 0.40,
 
 class ConstrainedRSEncoder:
     """
-    Complete encoding pipeline: RS + CRC + Homopolymer Constraint + GC Balance + Strong Markers.
+    Complete encoding pipeline: RS + CRC + Homopolymer Constraint + GC Balance + Robust Anchors.
 
-    Encoding pipeline (v2.1):
+    Encoding pipeline (v2.2 - robust anchors):
     1. Pad input to multiple of l bits
     2. Group into l-bit blocks, convert to GF(2^l) symbols
     3. RS encode: add c_rs parity symbols (GF(2^l))
@@ -196,7 +201,8 @@ class ConstrainedRSEncoder:
     5. Convert to DNA bits
     6. Homopolymer constraint: max_run-limited, deterministic
     7. GC balance: bit-level correction, reversible
-    8. Insert strong markers only (TACGTA, no weak markers)
+    8. Insert robust 5-mer anchors cycling through:
+       TAGCG -> TATCC -> TGACA -> TAGCG -> ...
     """
 
     def __init__(
@@ -256,7 +262,7 @@ class ConstrainedRSEncoder:
             constrained_bits, self.gc_low, self.gc_high
         )
 
-        dna_with_markers = self._insert_strong_markers(balanced_bits)
+        dna_with_markers, anchor_positions = self._insert_strong_markers(balanced_bits)
 
         metadata = {
             'k_bits': k_bits,
@@ -270,6 +276,10 @@ class ConstrainedRSEncoder:
             'gc_low': self.gc_low,
             'gc_high': self.gc_high,
             'strong_marker': STRONG_MARKER,
+            'strong_marker_len': STRONG_MARKER_LEN,
+            'strong_marker_cycle': STRONG_MARKER_CYCLE,
+            'blocks_per_strong': 32,
+            'anchor_positions': anchor_positions,
         }
 
         return dna_with_markers, metadata
@@ -340,29 +350,41 @@ class ConstrainedRSEncoder:
         return result
 
     def _insert_strong_markers(self, dna_bits: List[int],
-                                blocks_per_strong: int = 32) -> str:
+                                blocks_per_strong: int = 32) -> Tuple[str, List[int]]:
         """
-        Insert strong markers into the DNA sequence.
+        Insert robust 5-mer anchors into the DNA sequence.
 
-        Strong markers (TACGTA, 6bp) are inserted every
-        blocks_per_strong data blocks.
+        Anchors cycle through DEFAULT_ANCHORS in order:
+        TAGCG -> TATCC -> TGACA -> TAGCG -> ...
+
+        Anchors are inserted every blocks_per_strong data blocks.
+
+        Returns
+        -------
+        Tuple[str, List[int]]
+            (dna_with_anchors, list of anchor positions).
         """
         dna = binary_to_dna(dna_bits)
         l_dna = self.l // 2  # DNA bases per block
 
         result = []
+        positions = []
         i = 0
         block_idx = 0
+        anchor_cycle_idx = 0
         while i < len(dna):
             block_end = min(i + l_dna, len(dna))
             result.append(dna[i:block_end])
             i = block_end
             block_idx += 1
 
-            if block_idx > 0 and block_idx % blocks_per_strong == 0:
-                result.append(STRONG_MARKER)
+            if block_idx > 0 and block_idx % blocks_per_strong == 0 and i < len(dna):
+                anchor = STRONG_MARKER_CYCLE[anchor_cycle_idx % len(STRONG_MARKER_CYCLE)]
+                result.append(anchor)
+                positions.append(sum(len(p) for p in result) - len(anchor))
+                anchor_cycle_idx += 1
 
-        return ''.join(result)
+        return ''.join(result), positions
 
 
 def create_test_message(n_bits: int, seed: int = 42) -> List[int]:
