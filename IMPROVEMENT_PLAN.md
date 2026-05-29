@@ -91,7 +91,50 @@
 | 长序列支持 | 有限 | 滑动窗口 + 强标记截断 | **10kb+** |
 
 
----
+### 端到端集成状态（2026-05-30）
+
+#### 已完成模块（v2.1）
+
+| 模块 | 状态 | 说明 |
+|------|------|------|
+| `ConstrainedRSEncoder` | ✅ 完整 | RS + CRC-8 + 同聚体约束(max_run≤4) + GC平衡 + 鲁棒锚点 |
+| `MemoryKNanoporeChannel` | ✅ 完整 | Memory-k 信道，支持 Pd/Pi/Ps，输出 Phred 质量分数 |
+| `FSMJointDecoder` | ✅ 完整 | List Viterbi + Top-K 剪枝 + CRC 引导剪枝，heapq 优化 |
+| `AsymMGCDecoder` | ✅ 完整 | 滑窗 + marker 检测 + 回退状态传递 |
+| `DNAPipeline` | ✅ 完整 | 统一流水线：encode → channel → decode |
+| `LDPC Codec` | ✅ 完整 | 分级码率（HIGH/MEDIUM/LOW），Min-Sum 解码 |
+| `Outer Soft` | ✅ 完整 | 软判决共识 + GMD/OSD + Extrinsic IT |
+| `Robust Anchors` | ✅ 完整 | CHN 启发锚点系统，交叉验证 |
+| `BCJR Decoder` | ✅ 完整 | MAP 软判决，但需要滑动窗口才实用 |
+| `测试套件` | ✅ 完整 | 24 个端到端测试 + 31 个 FSM/TopK 测试全部通过 |
+
+#### 已修复的关键 Bug
+
+| Bug | 根因 | 修复 |
+|-----|------|------|
+| **Marker 不匹配** | 编码器用 `'TAGCG'`（5-mer），解码器用 `'TACGTA'`（6-mer） | 统一从 `encode.py` 导入 `STRONG_MARKER` |
+| **CRC 不兼容** | 编码端和解码端 CRC 多项式/bit 序不一致 | 统一使用 MSB-first CRC-8 |
+| **BCJR 删除转移** | 删除转移后 prev_base 未更新 | 在 `branch_metric_bcjr` 中修复 |
+| **回溯链跳线** | `traceback_path` 使用 `_best_per_state` dict | 改用 `prev_pm` 直接链接 |
+
+#### 已知瓶颈
+
+| 瓶颈 | 影响 | 优先级 | 备注 |
+|------|------|--------|------|
+| **Python dataclass hash 开销** | FSM 状态空间大时 decode 慢（~5-10s/百碱基） | **高** | Frozen dataclass `__hash__` 每步调用 2.3M+ 次，C 实现可降至 <0.1s |
+| **Marker 检测假阴性** | 低噪声下 marker 检测不全 | 中 | 同聚体约束使 marker 序列变形 |
+| **blocks_per_strong=32 过小** | 短消息（<32 blocks）不插入 marker | 中 | 需要足够长的 DNA 序列才能触发 marker |
+| **LDPC 未在正确位置集成** | 当前 LDPC 在单条 read 窗口级别，未在 consensus 级别 | 中 | Consensus 后再 LDPC 才能发挥最佳效果 |
+| **Viterbi 对 Substitution 无效** | Substitution 占比 60%，Viterbi 不可见 | **高** | 需要 BCJR 滑窗或 Neural Decoder |
+
+#### 下一步建议（对比实验）
+
+1. **Python 加速**：用 `numba`/`jax` 重写 FSM 核心解码逻辑（预期 100-1000× 提速），或用 Cython/NumPy 向量化
+2. **LDPC 集成到 consensus 后**：先对多个 read 做共识，再对 consensus 序列做 LDPC，而非当前的单 read 窗口级别
+3. **BCJR 滑窗实现**：对 BCJR 施加与 Viterbi 相同的滑窗机制，预期在保持软判决优势的同时将计算量降至可行范围
+4. **对比实验设计**：与原始 MGCP 在相同信道模型（Memory-k Nanopore）下比较 FER vs 码率
+
+
 
 
 
