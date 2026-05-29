@@ -329,6 +329,8 @@ class DNAPipeline:
         self.Pi = Pi
         self.Ps = Ps
 
+        # Use encoder's marker for the decoder (consistent marker is critical)
+        from .inner.encode import STRONG_MARKER
         self.encoder = ConstrainedRSEncoder(
             l=l, c_rs=c_rs, c_crc=c_crc,
             max_run=max_run, gc_low=gc_low, gc_high=gc_high,
@@ -339,6 +341,7 @@ class DNAPipeline:
             D_max=D_max, I_max=I_max,
             Pd=Pd, Pi=Pi, Ps=Ps,
             list_k=list_k,
+            strong_marker=STRONG_MARKER,
         )
 
         self._fsm_decoder = FSMJointDecoder(

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
+import heapq
 import numpy as np
 
 from .trellis import HomopolymerState
@@ -57,31 +58,50 @@ class FSMPathMetric:
 
 
 class FSMPathMetricTopK:
-    """Maintain top-K path metrics, sorted by log_prob descending."""
+    """
+    Maintain top-K path metrics using a min-heap for O(log K) insertion.
+    
+    Stores (log_prob, id, pm) tuples. The heap is a MIN-heap on log_prob,
+    so the smallest element is at the root. When size exceeds K, we pop
+    the smallest (worst) path. This ensures O(1) get_best() and O(log K)
+    add/extend operations.
+    """
+
+    _counter: int = 0  # Monotonic counter for tie-breaking
 
     def __init__(self, list_k: int = 8):
         self.list_k = list_k
-        self._metrics: List[FSMPathMetric] = []
+        self._heap: List[Tuple[float, int, "FSMPathMetric"]] = []
 
     def __len__(self) -> int:
-        return len(self._metrics)
+        return len(self._heap)
 
-    def add(self, pm: FSMPathMetric) -> None:
-        self._metrics.append(pm)
-        self._metrics.sort(key=lambda x: x.log_prob, reverse=True)
-        if len(self._metrics) > self.list_k:
-            self._metrics = self._metrics[:self.list_k]
+    def add(self, pm: "FSMPathMetric") -> None:
+        # Push (log_prob, counter, pm). Counter ensures stable ordering for ties.
+        heapq.heappush(self._heap, (pm.log_prob, FSMPathMetricTopK._counter, pm))
+        FSMPathMetricTopK._counter += 1
+        if len(self._heap) > self.list_k:
+            heapq.heappop(self._heap)
 
-    def extend(self, metrics: List[FSMPathMetric]) -> None:
-        self._metrics.extend(metrics)
-        self._metrics.sort(key=lambda x: x.log_prob, reverse=True)
-        self._metrics = self._metrics[:self.list_k]
+    def extend(self, metrics: List["FSMPathMetric"]) -> None:
+        for pm in metrics:
+            heapq.heappush(self._heap, (pm.log_prob, FSMPathMetricTopK._counter, pm))
+            FSMPathMetricTopK._counter += 1
+        if len(self._heap) > self.list_k:
+            self._heap = heapq.nlargest(self.list_k, self._heap)
+            heapq.heapify(self._heap)
 
-    def get_best(self) -> Optional[FSMPathMetric]:
-        return self._metrics[0] if self._metrics else None
+    def get_best(self) -> Optional["FSMPathMetric"]:
+        if not self._heap:
+            return None
+        # Return the pm with highest log_prob (root is min-heap, so heap[0] is worst)
+        return max(self._heap, key=lambda x: x[0])[2]
 
-    def get_all(self) -> List[FSMPathMetric]:
-        return self._metrics
+    def get_all(self) -> List["FSMPathMetric"]:
+        # Return sorted by log_prob descending
+        if not self._heap:
+            return []
+        return [item[2] for item in sorted(self._heap, key=lambda x: x[0], reverse=True)]
 
 
 # -----------------------------------------------------------------------
